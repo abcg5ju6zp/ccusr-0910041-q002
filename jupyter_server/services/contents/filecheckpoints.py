@@ -1,5 +1,7 @@
 """项目内部接口说明。"""
 
+import errno
+import filecmp
 import os
 import shutil
 import tempfile
@@ -20,8 +22,63 @@ from .checkpoints import (
 from .fileio import AsyncFileManagerMixin, FileManagerMixin
 
 
+def _same_checkpoint_file(path_a, path_b):
+    """Tell whether two checkpoint paths hold the same content.
+
+    Used to collapse the two copies a non-atomic move can leave behind.
+    ``samefile`` short-circuits hard links; a shallow content comparison
+    handles copies on filesystems that do not support atomic replace.
+    """
+    try:
+        if os.path.samefile(path_a, path_b):
+            return True
+    except OSError:
+        pass
+    try:
+        return filecmp.cmp(path_a, path_b, shallow=False)
+    except OSError:
+        return False
+
+
+def _move_path(src, dest):
+    """Move one file, tolerating filesystems without atomic replace.
+
+    ``os.rename``/``os.replace`` may raise ``EINVAL`` (or ``EXDEV``-style
+    errors on some network filesystems) even when the move itself is
+    otherwise possible.  In that case fall back to copy + unlink.  The copy
+    is fsync'ed before the source is removed so a crash does not lose the
+    checkpoint.
+    """
+    try:
+        os.replace(src, dest)
+    except OSError as e:
+        # Permission errors must propagate so perm_to_403 can translate them.
+        if e.errno not in (errno.EINVAL, errno.EXDEV):
+            raise
+        # Copy across, then only remove the source once the copy is durable.
+        shutil.copyfile(src, dest)
+        try:
+            shutil.copystat(src, dest)
+        except OSError:
+            pass
+        fd = os.open(dest, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        except OSError:
+            # Some filesystems (e.g. certain network mounts) do not support
+            # fsync; the copy itself has still completed.
+            pass
+        finally:
+            os.close(fd)
+        os.unlink(src)
+
+
 class FileCheckpoints(FileManagerMixin, Checkpoints):
     """项目内部接口说明。"""
+
+    #: Individual checkpoint moves are tracked and rolled back when the
+    #: content rename fails afterwards.
+    supports_rename_rollback = True
 
     checkpoint_dir = Unicode(
         ".ipynb_checkpoints",
@@ -58,17 +115,39 @@ class FileCheckpoints(FileManagerMixin, Checkpoints):
 
     # ContentsManager-independent checkpoint API
     def rename_checkpoint(self, checkpoint_id, old_path, new_path):
-        """项目内部接口说明。"""
+        """Move a single checkpoint file from old_path to new_path.
+
+        The operation is idempotent in both directions: it is a no-op when
+        the source checkpoint is gone but the destination already holds a
+        checkpoint, which makes retried renames and checkpoint rollbacks
+        safe after a mid-flight failure.
+
+        A checkpoint already present at the destination (e.g. an orphaned
+        checkpoint left after the destination content was deleted) is
+        replaced, matching the historical ``shutil.move`` behaviour; the
+        contents manager refuses renames onto existing content anyway.
+        """
         old_cp_path = self.checkpoint_path(checkpoint_id, old_path)
         new_cp_path = self.checkpoint_path(checkpoint_id, new_path)
-        if os.path.isfile(old_cp_path):
-            self.log.debug(
-                "Renaming checkpoint %s -> %s",
-                old_cp_path,
-                new_cp_path,
-            )
-            with self.perm_to_403():
-                shutil.move(old_cp_path, new_cp_path)
+        if not os.path.isfile(old_cp_path):
+            # The checkpoint already reached the destination on a previous
+            # attempt (or there was nothing to move); nothing to do.
+            return
+        if os.path.isfile(new_cp_path):
+            # Both locations hold a copy, which a non-atomic move can leave
+            # behind.  Identical copies collapse cheaply; otherwise the
+            # source copy wins, as it did with shutil.move.
+            if _same_checkpoint_file(old_cp_path, new_cp_path):
+                with self.perm_to_403():
+                    os.unlink(old_cp_path)
+                return
+        self.log.debug(
+            "Renaming checkpoint %s -> %s",
+            old_cp_path,
+            new_cp_path,
+        )
+        with self.perm_to_403():
+            _move_path(old_cp_path, new_cp_path)
 
     def delete_checkpoint(self, checkpoint_id, path):
         """项目内部接口说明。"""
@@ -152,17 +231,8 @@ class AsyncFileCheckpoints(FileCheckpoints, AsyncFileManagerMixin, AsyncCheckpoi
 
     # ContentsManager-independent checkpoint API
     async def rename_checkpoint(self, checkpoint_id, old_path, new_path):
-        """项目内部接口说明。"""
-        old_cp_path = self.checkpoint_path(checkpoint_id, old_path)
-        new_cp_path = self.checkpoint_path(checkpoint_id, new_path)
-        if os.path.isfile(old_cp_path):
-            self.log.debug(
-                "Renaming checkpoint %s -> %s",
-                old_cp_path,
-                new_cp_path,
-            )
-            with self.perm_to_403():
-                await run_sync(shutil.move, old_cp_path, new_cp_path)
+        """Move a single checkpoint file; see FileCheckpoints.rename_checkpoint."""
+        await run_sync(FileCheckpoints.rename_checkpoint, self, checkpoint_id, old_path, new_path)
 
     async def delete_checkpoint(self, checkpoint_id, path):
         """项目内部接口说明。"""

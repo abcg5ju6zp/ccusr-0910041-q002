@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import functools
 import math
 import mimetypes
 import os
@@ -56,6 +57,157 @@ def _get_created_timestamp(info: os.stat_result) -> float:
     # Fallback to st_ctime; validation happens in _base_model() during datetime conversion
     # where OverflowError and other conversion errors are caught and handled
     return info.st_ctime
+
+
+def _rename_disk_state(old_os_path, new_os_path, log=None):
+    """Classify the on-disk state of a (possibly retried) rename.
+
+    Returns one of:
+
+    - ``"alias"``: both paths point at the same directory entry
+    - ``"resume"``: the source is gone and the destination exists
+    - ``"absent"``: neither path exists
+    - ``"move"``: only the source exists
+    - ``"conflict"``: both exist as different entries
+
+    Note that a genuine conflict (two distinct files with identical
+    contents, e.g. two empty notebooks) cannot be told apart from the
+    duplicate a non-atomic move leaves behind, so it stays a conflict; the
+    copy fallback in :func:`_move_on_disk` cleans partial destinations up
+    itself instead of relying on content comparison.
+    """
+    old_exists = os.path.exists(old_os_path)
+    new_exists = os.path.exists(new_os_path)
+    if old_exists and new_exists:
+        try:
+            if samefile(old_os_path, new_os_path):
+                return "alias"
+        except OSError:
+            pass
+        return "conflict"
+    if not old_exists and new_exists:
+        return "resume"
+    if not old_exists:
+        return "absent"
+    return "move"
+
+
+def _remove_path(os_path):
+    """项目内部接口说明。"""
+    if os.path.isdir(os_path) and not os.path.islink(os_path):
+        shutil.rmtree(os_path)
+    else:
+        os.unlink(os_path)
+
+
+def _move_on_disk(src, dst, *, log=None):
+    """Move src to dst, working on filesystems without atomic replace.
+
+    Falls back to a copy-then-unlink sequence when ``os.replace`` cannot be
+    used (``EINVAL``/``EXDEV`` from some network filesystems).  The source is
+    unlinked only after the copy has been flushed, so the move does not lose
+    data on crash.
+
+    The move is *not* required to be atomic; callers recover using the
+    state-detection helpers instead.
+    """
+    try:
+        shutil.move(src, dst)
+        return
+    except OSError as e:
+        if e.errno not in (errno.EINVAL, errno.EXDEV):
+            raise
+        if log:
+            log.debug("os.replace unsupported for %s -> %s; using copy fallback", src, dst)
+
+    # Copy-then-unlink fallback.  shutil.copy2 preserves metadata best-effort.
+    try:
+        if os.path.isdir(src):
+            shutil.copytree(src, dst, symlinks=True)
+        else:
+            shutil.copy2(src, dst)
+    except OSError:
+        # The copy did not complete; remove any partial destination so the
+        # failure state stays "source untouched, destination absent" and the
+        # caller can safely retry.
+        if os.path.exists(dst) and not _same_os_path(src, dst):
+            try:
+                if os.path.isdir(dst):
+                    shutil.rmtree(dst)
+                else:
+                    os.unlink(dst)
+            except OSError:
+                if log:
+                    log.warning(
+                        "Could not clean up partial move destination %s", dst, exc_info=True
+                    )
+        raise
+
+    _fsync_path(dst)
+    try:
+        _remove_path(src)
+    except OSError:
+        # The destination holds a complete, durable copy; retry the source
+        # removal a few times to cover transient network-fs locks (e.g. an
+        # NFS "silly rename").  If it still cannot be removed, surface the
+        # error: the content is safe at dst, while the stale source needs
+        # cleanup before a retry can converge.
+        for attempt in range(3):
+            try:
+                _remove_path(src)
+                break
+            except OSError:
+                if attempt == 2:
+                    if log:
+                        log.error(
+                            "Moved %s to %s but could not remove the source; "
+                            "the content is safe at the destination but the "
+                            "stale source must be removed before retrying",
+                            src,
+                            dst,
+                            exc_info=True,
+                        )
+                    raise
+
+
+def _fsync_path(path):
+    """Flush a copied file or directory tree best effort."""
+    if os.path.isdir(path):
+        # Make a copied directory tree durably visible before removing the
+        # source.
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                try:
+                    fd = os.open(os.path.join(root, name), os.O_RDONLY)
+                except OSError:
+                    continue
+                try:
+                    os.fsync(fd)
+                except OSError:
+                    pass
+                finally:
+                    os.close(fd)
+    else:
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            # Some filesystems (e.g. certain network mounts) do not support
+            # fsync; the copy itself has still completed.
+            pass
+        finally:
+            os.close(fd)
+
+
+def _same_os_path(path_a, path_b):
+    """项目内部接口说明。"""
+    try:
+        return os.path.samefile(path_a, path_b)
+    except OSError:
+        return False
 
 
 class FileContentsManager(FileManagerMixin, ContentsManager):
@@ -513,6 +665,33 @@ class FileContentsManager(FileManagerMixin, ContentsManager):
             with self.perm_to_403():
                 rm(os_path)
 
+    def preflight_rename(self, old_path, new_path):
+        """Validate a rename before any content or checkpoint state changes.
+
+        This is called by :meth:`ContentsManager.rename` *before* checkpoints
+        are moved, so a destination conflict (409), a hidden-path refusal
+        (400) or a missing source (404) surfaces without touching checkpoint
+        storage.  A rename whose content move already completed on an earlier
+        attempt (``old_path`` gone, ``new_path`` present) is accepted so the
+        caller can finish it by retrying.
+        """
+        old_path = old_path.strip("/")
+        new_path = new_path.strip("/")
+        new_os_path = self._get_os_path(new_path)
+        old_os_path = self._get_os_path(old_path)
+
+        if not self.allow_hidden and (
+            is_hidden(old_os_path, self.root_dir) or is_hidden(new_os_path, self.root_dir)
+        ):
+            raise web.HTTPError(400, f"Cannot rename file or directory {old_os_path!r}")
+
+        state = _rename_disk_state(old_os_path, new_os_path)
+        if state == "conflict":
+            raise web.HTTPError(409, "File already exists: %s" % new_path)
+        if state == "absent":
+            raise web.HTTPError(404, f"File or directory does not exist: {old_path}")
+        # "resume" and "move"/"alias" are all allowed to proceed.
+
     def rename_file(self, old_path, new_path):
         """项目内部接口说明。"""
         old_path = old_path.strip("/")
@@ -528,14 +707,28 @@ class FileContentsManager(FileManagerMixin, ContentsManager):
         ):
             raise web.HTTPError(400, f"Cannot rename file or directory {old_os_path!r}")
 
-        # Should we proceed with the move?
-        if os.path.exists(new_os_path) and not samefile(old_os_path, new_os_path):
+        state = _rename_disk_state(old_os_path, new_os_path)
+        if state == "conflict":
             raise web.HTTPError(409, "File already exists: %s" % new_path)
+        if state == "resume":
+            # A previous attempt moved the content here before failing later
+            # (e.g. the checkpoint store was briefly unavailable).  Nothing
+            # is left to do on the content side; rename() finishes the
+            # checkpoints and emits the event.
+            self.log.debug(
+                "Rename of %s to %s already completed on disk; resuming",
+                old_path,
+                new_path,
+            )
+            return
+        if state == "absent":
+            raise web.HTTPError(404, f"File or directory does not exist: {old_path}")
 
-        # Move the file
+        # state is "move" (only the source exists) or "alias" (hard link /
+        # case-only alias which must still be renamed in place).
         try:
             with self.perm_to_403():
-                shutil.move(old_os_path, new_os_path)
+                _move_on_disk(old_os_path, new_os_path, log=self.log)
         except web.HTTPError:
             raise
         except FileNotFoundError:
@@ -928,6 +1121,24 @@ class AsyncFileContentsManager(  # type: ignore[misc]
             with self.perm_to_403():
                 await run_sync(rm, os_path)
 
+    async def preflight_rename(self, old_path, new_path):
+        """Asynchronous counterpart of FileContentsManager.preflight_rename."""
+        old_path = old_path.strip("/")
+        new_path = new_path.strip("/")
+        new_os_path = self._get_os_path(new_path)
+        old_os_path = self._get_os_path(old_path)
+
+        if not self.allow_hidden and (
+            is_hidden(old_os_path, self.root_dir) or is_hidden(new_os_path, self.root_dir)
+        ):
+            raise web.HTTPError(400, f"Cannot rename file or directory {old_os_path!r}")
+
+        state = _rename_disk_state(old_os_path, new_os_path)
+        if state == "conflict":
+            raise web.HTTPError(409, "File already exists: %s" % new_path)
+        if state == "absent":
+            raise web.HTTPError(404, f"File or directory does not exist: {old_path}")
+
     async def rename_file(self, old_path, new_path):
         """项目内部接口说明。"""
         old_path = old_path.strip("/")
@@ -943,14 +1154,25 @@ class AsyncFileContentsManager(  # type: ignore[misc]
         ):
             raise web.HTTPError(400, f"Cannot rename file or directory {old_os_path!r}")
 
-        # Should we proceed with the move?
-        if os.path.exists(new_os_path) and not samefile(old_os_path, new_os_path):
+        state = _rename_disk_state(old_os_path, new_os_path)
+        if state == "conflict":
             raise web.HTTPError(409, "File already exists: %s" % new_path)
+        if state == "resume":
+            self.log.debug(
+                "Rename of %s to %s already completed on disk; resuming",
+                old_path,
+                new_path,
+            )
+            return
+        if state == "absent":
+            raise web.HTTPError(404, f"File or directory does not exist: {old_path}")
 
         # Move the file
         try:
             with self.perm_to_403():
-                await run_sync(shutil.move, old_os_path, new_os_path)
+                await run_sync(
+                    functools.partial(_move_on_disk, log=self.log), old_os_path, new_os_path
+                )
         except web.HTTPError:
             raise
         except FileNotFoundError:

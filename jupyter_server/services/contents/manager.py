@@ -399,11 +399,74 @@ class ContentsManager(LoggingConfigurable):
         self.checkpoints.delete_all_checkpoints(path)
         self.emit(data={"action": "delete", "path": path})
 
+    def _emit_rename_event(self, old_path, new_path):
+        """Emit the rename event reflecting the committed final state.
+
+        Events describe facts only, so an event-logger failure must not make
+        a successful rename look failed (which would tempt the caller into a
+        harmful retry).
+        """
+        try:
+            self.emit(data={"action": "rename", "path": new_path, "source_path": old_path})
+        except Exception:
+            self.log.warning(
+                "Failed to emit rename event for %s -> %s",
+                old_path,
+                new_path,
+                exc_info=True,
+            )
+
     def rename(self, old_path, new_path):
         """项目内部接口说明。"""
-        self.rename_file(old_path, new_path)
-        self.checkpoints.rename_all_checkpoints(old_path, new_path)
-        self.emit(data={"action": "rename", "path": new_path, "source_path": old_path})
+        old_path = old_path.strip("/")
+        new_path = new_path.strip("/")
+        if new_path == old_path:
+            return
+
+        checkpoints = self.checkpoints
+        resume = not self.exists(old_path) and self.exists(new_path)
+
+        if getattr(checkpoints, "supports_rename_rollback", False):
+            # New, recoverable ordering for checkpoint stores that track
+            # individual moves and can roll them back:
+            #
+            # 1. Refuse conflicts / hidden paths / missing sources *before*
+            #    any state changes (unless we are resuming a rename whose
+            #    content move already finished).
+            # 2. Move checkpoints first; a transient checkpoint-store
+            #    outage then fails while everything is still untouched.
+            # 3. Move the content; if that fails, undo the checkpoint moves.
+            #
+            # Either failure leaves a state the caller can retry: the
+            # individual checkpoint move and the content move are both
+            # idempotent, and a completed-but-uncertain rename is picked up
+            # by the "resume" branch above.
+            if not resume and hasattr(self, "preflight_rename"):
+                self.preflight_rename(old_path, new_path)
+            _moved_ids, rollback_checkpoints = checkpoints.move_all_checkpoints(old_path, new_path)
+            if not resume:
+                try:
+                    self.rename_file(old_path, new_path)
+                except BaseException:
+                    rollback_errors = rollback_checkpoints()
+                    if rollback_errors:
+                        self.log.error(
+                            "Content rename %s -> %s failed and checkpoint "
+                            "rollback also failed (%r); retrying the rename "
+                            "is safe and will converge",
+                            old_path,
+                            new_path,
+                            rollback_errors,
+                        )
+                    raise
+        else:
+            # Legacy ordering for custom checkpoint backends that do not
+            # opt into rollback support: content first, checkpoints second.
+            if not resume:
+                self.rename_file(old_path, new_path)
+            checkpoints.rename_all_checkpoints(old_path, new_path)
+
+        self._emit_rename_event(old_path, new_path)
 
     def update(self, model, path):
         """项目内部接口说明。"""
@@ -689,9 +752,44 @@ class AsyncContentsManager(ContentsManager):
 
     async def rename(self, old_path, new_path):
         """项目内部接口说明。"""
-        await self.rename_file(old_path, new_path)
-        await self.checkpoints.rename_all_checkpoints(old_path, new_path)
-        self.emit(data={"action": "rename", "path": new_path, "source_path": old_path})
+        old_path = old_path.strip("/")
+        new_path = new_path.strip("/")
+        if new_path == old_path:
+            return
+
+        checkpoints = self.checkpoints
+        # exists() may be coroutine or plain bool depending on the MRO.
+        resume = not await ensure_async(self.exists(old_path)) and await ensure_async(
+            self.exists(new_path)
+        )
+
+        if getattr(checkpoints, "supports_rename_rollback", False):
+            if not resume and hasattr(self, "preflight_rename"):
+                await ensure_async(self.preflight_rename(old_path, new_path))
+            _moved_ids, rollback_checkpoints = await checkpoints.move_all_checkpoints(
+                old_path, new_path
+            )
+            if not resume:
+                try:
+                    await self.rename_file(old_path, new_path)
+                except BaseException:
+                    rollback_errors = await rollback_checkpoints()
+                    if rollback_errors:
+                        self.log.error(
+                            "Content rename %s -> %s failed and checkpoint "
+                            "rollback also failed (%r); retrying the rename "
+                            "is safe and will converge",
+                            old_path,
+                            new_path,
+                            rollback_errors,
+                        )
+                    raise
+        else:
+            if not resume:
+                await self.rename_file(old_path, new_path)
+            await checkpoints.rename_all_checkpoints(old_path, new_path)
+
+        self._emit_rename_event(old_path, new_path)
 
     async def update(self, model, path):
         """项目内部接口说明。"""

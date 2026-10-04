@@ -31,8 +31,28 @@ class Checkpoints(LoggingConfigurable):
 
     def rename_all_checkpoints(self, old_path, new_path):
         """项目内部接口说明。"""
-        for cp in self.list_checkpoints(old_path):
-            self.rename_checkpoint(cp["id"], old_path, new_path)
+        # Rename checkpoints one at a time; if one of them fails, move the
+        # ones that were already renamed back (best effort) so the whole set
+        # stays registered under a single path and the rename can be retried.
+        renamed_checkpoint_ids = []
+        try:
+            for cp in self.list_checkpoints(old_path):
+                self.rename_checkpoint(cp["id"], old_path, new_path)
+                renamed_checkpoint_ids.append(cp["id"])
+        except Exception:
+            for checkpoint_id in renamed_checkpoint_ids:
+                try:
+                    self.rename_checkpoint(checkpoint_id, new_path, old_path)
+                except Exception:
+                    self.log.error(
+                        "Failed to move checkpoint %s back to %s while rolling "
+                        "back a failed rename to %s",
+                        checkpoint_id,
+                        old_path,
+                        new_path,
+                        exc_info=True,
+                    )
+            raise
 
     def delete_all_checkpoints(self, path):
         """项目内部接口说明。"""
@@ -114,8 +134,28 @@ class AsyncCheckpoints(Checkpoints):
 
     async def rename_all_checkpoints(self, old_path, new_path):
         """项目内部接口说明。"""
-        for cp in await self.list_checkpoints(old_path):
-            await self.rename_checkpoint(cp["id"], old_path, new_path)
+        # Rename checkpoints one at a time; if one of them fails, move the
+        # ones that were already renamed back (best effort) so the whole set
+        # stays registered under a single path and the rename can be retried.
+        renamed_checkpoint_ids = []
+        try:
+            for cp in await self.list_checkpoints(old_path):
+                await self.rename_checkpoint(cp["id"], old_path, new_path)
+                renamed_checkpoint_ids.append(cp["id"])
+        except Exception:
+            for checkpoint_id in renamed_checkpoint_ids:
+                try:
+                    await self.rename_checkpoint(checkpoint_id, new_path, old_path)
+                except Exception:
+                    self.log.error(
+                        "Failed to move checkpoint %s back to %s while rolling "
+                        "back a failed rename to %s",
+                        checkpoint_id,
+                        old_path,
+                        new_path,
+                        exc_info=True,
+                    )
+            raise
 
     async def delete_all_checkpoints(self, path):
         """项目内部接口说明。"""

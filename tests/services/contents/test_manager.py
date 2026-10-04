@@ -866,6 +866,87 @@ async def test_rename_nonexistent(jp_contents_manager):
     assert expected_http_error(e, 404)
 
 
+async def test_rename_checkpoint_failure_rolls_back(jp_contents_manager):
+    """项目内部接口说明。"""
+    cm = jp_contents_manager
+    # Create a notebook with a checkpoint.
+    nb, name, path = await new_notebook(cm)
+    await ensure_async(cm.create_checkpoint(path))
+    new_path = "renamed.ipynb"
+
+    # Record emitted events to check none claims a rename happened.
+    emitted_events = []
+    cm.emit = lambda data: emitted_events.append(data)
+
+    # Simulate a transient checkpoint storage failure: the content file is
+    # moved, then renaming the checkpoint fails.
+    boom = HTTPError(500, "checkpoint storage is temporarily unavailable")
+    with (
+        patch.object(cm.checkpoints, "rename_checkpoint", side_effect=boom),
+        pytest.raises(HTTPError) as e,
+    ):
+        await ensure_async(cm.rename(path, new_path))
+    # The original error propagates ...
+    assert e.value is boom
+    # ... and the content is back at its original path, so the failed rename
+    # left no partial state behind and is safe to retry.
+    assert await ensure_async(cm.file_exists(path))
+    assert not await ensure_async(cm.exists(new_path))
+    # The checkpoint is still registered under the original path.
+    assert len(await ensure_async(cm.list_checkpoints(path))) == 1
+    assert await ensure_async(cm.list_checkpoints(new_path)) == []
+    # No rename event was emitted for the rolled-back rename.
+    assert [data for data in emitted_events if data["action"] == "rename"] == []
+
+    # Once the checkpoint storage recovers, retrying the rename works.
+    await ensure_async(cm.rename(path, new_path))
+    assert not await ensure_async(cm.exists(path))
+    assert await ensure_async(cm.file_exists(new_path))
+    assert len(await ensure_async(cm.list_checkpoints(new_path))) == 1
+    rename_events = [data for data in emitted_events if data["action"] == "rename"]
+    assert rename_events == [{"action": "rename", "path": new_path, "source_path": path}]
+
+
+async def test_rename_checkpoint_failure_rollback_failure(jp_contents_manager):
+    """项目内部接口说明。"""
+    cm = jp_contents_manager
+    # Create a notebook with a checkpoint.
+    nb, name, path = await new_notebook(cm)
+    await ensure_async(cm.create_checkpoint(path))
+    new_path = "renamed.ipynb"
+
+    emitted_events = []
+    cm.emit = lambda data: emitted_events.append(data)
+
+    def fail_and_recreate_source(*args, **kwargs):
+        # The checkpoint rename fails and, before the rollback runs, the
+        # source path is taken again (e.g. by a concurrent save), so moving
+        # the content back runs into an existing destination.
+        with open(cm._get_os_path(path), "w") as f:
+            f.write("recreated")
+        raise HTTPError(500, "checkpoint storage is temporarily unavailable")
+
+    with (
+        patch.object(cm.checkpoints, "rename_checkpoint", side_effect=fail_and_recreate_source),
+        pytest.raises(HTTPError) as e,
+    ):
+        await ensure_async(cm.rename(path, new_path))
+    # The error must say the rename is half applied instead of pretending
+    # nothing happened.
+    assert expected_http_error(e, 500)
+    assert "manual recovery" in str(e.value)
+
+    # The content stayed at the new path ...
+    assert await ensure_async(cm.file_exists(new_path))
+    # ... the source path is held by the conflicting file ...
+    assert await ensure_async(cm.file_exists(path))
+    # ... and the checkpoint never moved.
+    assert len(await ensure_async(cm.list_checkpoints(path))) == 1
+    assert await ensure_async(cm.list_checkpoints(new_path)) == []
+    # No rename event was emitted: the rename did not complete.
+    assert [data for data in emitted_events if data["action"] == "rename"] == []
+
+
 async def test_delete_root(jp_contents_manager):
     cm = jp_contents_manager
     with pytest.raises(HTTPError) as e:

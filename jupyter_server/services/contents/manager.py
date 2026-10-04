@@ -402,7 +402,46 @@ class ContentsManager(LoggingConfigurable):
     def rename(self, old_path, new_path):
         """项目内部接口说明。"""
         self.rename_file(old_path, new_path)
-        self.checkpoints.rename_all_checkpoints(old_path, new_path)
+        try:
+            self.checkpoints.rename_all_checkpoints(old_path, new_path)
+        except Exception as e:
+            # The content moved but its checkpoints could not follow. Move the
+            # content back so that a failed rename leaves the original state
+            # intact and the caller can safely retry. The rollback goes
+            # through rename_file (not os.replace & friends) so that it behaves
+            # like the forward move on filesystems without atomic replace and
+            # across devices.
+            self.log.warning(
+                "Checkpoints could not follow the rename of %s to %s; "
+                "moving the content back",
+                old_path,
+                new_path,
+                exc_info=True,
+            )
+            try:
+                self.rename_file(new_path, old_path)
+            except Exception as rollback_error:
+                # Rolling back failed too (e.g. old_path exists again). The
+                # content is at new_path while checkpoints may still be
+                # registered under old_path: report the actual on-disk state
+                # instead of pretending the rename never happened.
+                self.log.error(
+                    "Could not move %s back to %s after a failed rename",
+                    new_path,
+                    old_path,
+                    exc_info=True,
+                )
+                raise HTTPError(
+                    500,
+                    f"Rename of {old_path} to {new_path} failed while renaming "
+                    f"checkpoints ({e}), and moving the content back failed too "
+                    f"({rollback_error}). The content is now at {new_path} while "
+                    f"its checkpoints may still be registered under {old_path}; "
+                    f"manual recovery is required before retrying.",
+                ) from e
+            raise
+        # Only emit once the rename fully succeeded: events must reflect the
+        # final state, and a rename that was rolled back never happened.
         self.emit(data={"action": "rename", "path": new_path, "source_path": old_path})
 
     def update(self, model, path):
@@ -690,7 +729,46 @@ class AsyncContentsManager(ContentsManager):
     async def rename(self, old_path, new_path):
         """项目内部接口说明。"""
         await self.rename_file(old_path, new_path)
-        await self.checkpoints.rename_all_checkpoints(old_path, new_path)
+        try:
+            await self.checkpoints.rename_all_checkpoints(old_path, new_path)
+        except Exception as e:
+            # The content moved but its checkpoints could not follow. Move the
+            # content back so that a failed rename leaves the original state
+            # intact and the caller can safely retry. The rollback goes
+            # through rename_file (not os.replace & friends) so that it behaves
+            # like the forward move on filesystems without atomic replace and
+            # across devices.
+            self.log.warning(
+                "Checkpoints could not follow the rename of %s to %s; "
+                "moving the content back",
+                old_path,
+                new_path,
+                exc_info=True,
+            )
+            try:
+                await self.rename_file(new_path, old_path)
+            except Exception as rollback_error:
+                # Rolling back failed too (e.g. old_path exists again). The
+                # content is at new_path while checkpoints may still be
+                # registered under old_path: report the actual on-disk state
+                # instead of pretending the rename never happened.
+                self.log.error(
+                    "Could not move %s back to %s after a failed rename",
+                    new_path,
+                    old_path,
+                    exc_info=True,
+                )
+                raise HTTPError(
+                    500,
+                    f"Rename of {old_path} to {new_path} failed while renaming "
+                    f"checkpoints ({e}), and moving the content back failed too "
+                    f"({rollback_error}). The content is now at {new_path} while "
+                    f"its checkpoints may still be registered under {old_path}; "
+                    f"manual recovery is required before retrying.",
+                ) from e
+            raise
+        # Only emit once the rename fully succeeded: events must reflect the
+        # final state, and a rename that was rolled back never happened.
         self.emit(data={"action": "rename", "path": new_path, "source_path": old_path})
 
     async def update(self, model, path):
